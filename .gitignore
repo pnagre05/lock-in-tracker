@@ -1,0 +1,24 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*~
+
+# Virtual environment
+env/
+venv/
+ENV/
+
+# IDE/editor files
+.vscode/
+*.suo
+*.user
+*.pdb
+
+# Environment variables file
+.env
+
+# MediaPipe model
+face_landmarker.task
+
+# Logs
+*.log
