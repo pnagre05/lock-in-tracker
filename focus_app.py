@@ -477,10 +477,6 @@ class FocusMonitorApp(ctk.CTk):
         """Show tooltip info."""
         self.info_label.configure(text=f"{title}:\n{description}")
     
-    def show_tooltip(self, title, description):
-        """Show tooltip info."""
-        self.info_label.configure(text=f"{title}:\n{description}")
-    
     def hide_tooltip(self):
         """Hide tooltip info."""
         self.info_label.configure(text="")

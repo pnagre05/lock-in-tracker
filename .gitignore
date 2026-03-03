@@ -22,3 +22,9 @@ face_landmarker.task
 
 # Logs
 *.log
+
+# SQLite databases and journals
+*.db
+*.sqlite
+*.sqlite3
+*-journal
