@@ -59,7 +59,7 @@ def cv2_to_pil(cv_image):
 # database helper ----------------------------------------------------------
 
 def init_db(db_path='focus_data.db'):
-    """Ensure the SQLite database and sessions table exist."""
+    """Ensure the SQLite database and sessions table exist with proper schema."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute(
@@ -69,10 +69,17 @@ def init_db(db_path='focus_data.db'):
             date TEXT NOT NULL,
             total_duration REAL,
             focused_duration REAL,
-            final_score REAL
+            final_score REAL,
+            distraction_points INTEGER DEFAULT 0
         )
         '''
     )
+    # migrate existing table to add distraction_points if missing
+    try:
+        cursor.execute("SELECT distraction_points FROM sessions LIMIT 1")
+    except sqlite3.OperationalError:
+        # column doesn't exist, add it
+        cursor.execute("ALTER TABLE sessions ADD COLUMN distraction_points INTEGER DEFAULT 0")
     conn.commit()
     return conn
 
@@ -125,6 +132,7 @@ class Backend(threading.Thread):
         self.quit_event = threading.Event()
         self.distraction_start = None
         self.last_beep = 0
+        self.last_distraction_increment = 0  # track when we last incremented distraction_points
         # dynamic thresholds (GUI updates these on-the-fly)
         self.yaw_threshold = 20.0
         self.pitch_threshold = 25.0
@@ -132,6 +140,9 @@ class Backend(threading.Thread):
         self.total_session_time = 0.0
         self.cumulative_focused_time = 0.0
         self._last_time = time.time()
+        # gamified tracking
+        self.focus_streak = 0.0  # accumulates while focused
+        self.distraction_points = 0  # increments on distraction events
         # capture thread that constantly reads from camera
         self.capture = CameraCapture()
         self.capture.start()
@@ -236,9 +247,14 @@ class Backend(threading.Thread):
                 is_eye_focused = 0.35 < gr < 0.65
                 is_focused = is_head_focused and is_eye_focused
                 
-                # logarithmic beep on excessive yaw (static threshold remains 20 for alert)
+                # beep on excessive yaw triggers distraction point
                 nowt = time.time()
                 if abs(yaw) > 20 and nowt - self.last_beep > 1.0:
+                    # beep + distraction increment (debounced)
+                    if nowt - self.last_distraction_increment > 0.5:
+                        self.distraction_points += 1
+                        self.focus_streak = 0.0
+                        self.last_distraction_increment = nowt
                     threading.Thread(target=winsound.Beep, args=(1000, 200), daemon=True).start()
                     self.last_beep = nowt
                 
@@ -254,20 +270,14 @@ class Backend(threading.Thread):
                 box_color = (0, 255, 0) if is_focused else (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
             
-            # distraction timer logic
+            # gamified focus streak logic based on beeps
             now = time.time()
             is_paused = self.pause_event.is_set()
             
-            if not is_focused and not is_paused:
-                if self.distraction_start is None:
-                    self.distraction_start = now
-                counter = now - self.distraction_start
-                if counter > 2.0:
-                    # beep trigger
-                    pass
-            else:
-                self.distraction_start = None
-                counter = 0.0
+            if is_focused and not is_paused:
+                # accumulate focus streak while focused
+                self.focus_streak += dt
+            # else: not focused - only beeps reset streak (no auto-timeout)
             
             # compute focus score
             focus_score = 0.0
@@ -279,7 +289,8 @@ class Backend(threading.Thread):
                 'yaw': int(yaw),
                 'pitch': int(pitch),
                 'gr': float(gr),
-                'counter': float(counter),
+                'focus_streak': float(self.focus_streak),
+                'distraction_points': int(self.distraction_points),
                 'is_focused': is_focused,
                 'focus_score': focus_score
             })
@@ -330,13 +341,13 @@ class FocusMonitorApp(ctk.CTk):
         live_tab.grid_columnconfigure(1, weight=1)
         live_tab.grid_rowconfigure(0, weight=1)
 
-        # video feed frame
-        self.video_frame = ctk.CTkLabel(live_tab, text="Loading...", fg_color="gray20")
+        # video feed frame (with modern styling)
+        self.video_frame = ctk.CTkLabel(live_tab, text="Loading...", fg_color="#1E1E1E", corner_radius=15)
         self.video_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         self.video_tk = None
 
-        # sidebar in live tab
-        self.sidebar = ctk.CTkFrame(live_tab, fg_color="gray10")
+        # sidebar in live tab (with modern styling)
+        self.sidebar = ctk.CTkFrame(live_tab, fg_color="#1E1E1E", corner_radius=15)
         self.sidebar.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
         self.sidebar.grid_rowconfigure(15, weight=1)
 
@@ -358,10 +369,16 @@ class FocusMonitorApp(ctk.CTk):
         self.gr_label.bind("<Enter>", lambda e: self.show_tooltip("GR", "Horizontal iris position (0.35-0.65)"))
         self.gr_label.bind("<Leave>", lambda e: self.hide_tooltip())
 
-        self.counter_label = ctk.CTkLabel(self.sidebar, text="Distraction: --.-- s", font=("Arial", 12), text_color="yellow")
-        self.counter_label.pack(pady=5)
-        self.counter_label.bind("<Enter>", lambda e: self.show_tooltip("Distraction", "Seconds since focus lost"))
-        self.counter_label.bind("<Leave>", lambda e: self.hide_tooltip())
+        # gamified distraction per minute display
+        self.dpm_label = ctk.CTkLabel(self.sidebar, text="Distractions/Min: 0.0", font=("Arial", 12, "bold"), text_color="#00FF00")
+        self.dpm_label.pack(pady=8)
+        self.dpm_label.bind("<Enter>", lambda e: self.show_tooltip("Distractions/Min", "Distraction events per minute"))
+        self.dpm_label.bind("<Leave>", lambda e: self.hide_tooltip())
+
+        self.distraction_label = ctk.CTkLabel(self.sidebar, text="Distraction Points: 0", font=("Arial", 12, "bold"), text_color="#FF0000")
+        self.distraction_label.pack(pady=8)
+        self.distraction_label.bind("<Enter>", lambda e: self.show_tooltip("Points", "Distraction events detected"))
+        self.distraction_label.bind("<Leave>", lambda e: self.hide_tooltip())
 
         # calibration sliders
         ctk.CTkLabel(self.sidebar, text="Yaw Threshold", font=("Arial", 12)).pack(pady=(10,2))
@@ -377,32 +394,63 @@ class FocusMonitorApp(ctk.CTk):
         self.pitch_slider.pack(pady=5, fill="x", padx=5)
 
         # focus score label
-        self.score_label = ctk.CTkLabel(self.sidebar, text="Score: --%", font=("Arial", 12, "bold"))
+        self.score_label = ctk.CTkLabel(self.sidebar, text="Score: --%", font=("Arial", 12, "bold"), text_color="#00CCFF")
         self.score_label.pack(pady=10)
 
         # tooltip info label
         self.info_label = ctk.CTkLabel(self.sidebar, text="", font=("Arial", 10), text_color="cyan", wraplength=120)
         self.info_label.pack(pady=20, padx=5)
 
-        # buttons
-        self.pause_button = ctk.CTkButton(self.sidebar, text="Pause", command=self.toggle_pause, font=("Arial", 12))
+        # buttons (with modern styling)
+        self.pause_button = ctk.CTkButton(self.sidebar, text="Pause", command=self.toggle_pause, font=("Arial", 12), corner_radius=10, fg_color="#007ACC")
         self.pause_button.pack(pady=10, fill="x", padx=5)
 
-        self.quit_button = ctk.CTkButton(self.sidebar, text="Quit", command=self.quit_app, font=("Arial", 12), fg_color="darkred")
+        self.quit_button = ctk.CTkButton(self.sidebar, text="Quit", command=self.quit_app, font=("Arial", 12), fg_color="#CC0000", corner_radius=10)
         self.quit_button.pack(pady=10, fill="x", padx=5)
 
         # -------- analytics tab setup --------
+        # split analytics into two frames
+        analytics_tab.grid_rowconfigure(0, weight=0)
+        analytics_tab.grid_rowconfigure(1, weight=1)
+        analytics_tab.grid_columnconfigure(0, weight=1)
+
+        # top frame: lifetime stats
+        stats_frame = ctk.CTkFrame(analytics_tab, fg_color="#1E1E1E", corner_radius=15)
+        stats_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        stats_frame.grid_columnconfigure((0, 1, 2), weight=1)
+
+        ctk.CTkLabel(stats_frame, text="Lifetime Stats", font=("Arial", 14, "bold")).grid(row=0, column=0, columnspan=3, pady=10)
+
+        self.total_hours_label = ctk.CTkLabel(stats_frame, text="Total Hours Focused\n0.0h", font=("Arial", 12, "bold"), text_color="#00FF00")
+        self.total_hours_label.grid(row=1, column=0, padx=10, pady=10)
+
+        self.total_distractions_label = ctk.CTkLabel(stats_frame, text="Total Distractions\n0", font=("Arial", 12, "bold"), text_color="#FF0000")
+        self.total_distractions_label.grid(row=1, column=1, padx=10, pady=10)
+
+        self.avg_score_label = ctk.CTkLabel(stats_frame, text="All-Time Avg Score\n0.0%", font=("Arial", 12, "bold"), text_color="#00CCFF")
+        self.avg_score_label.grid(row=1, column=2, padx=10, pady=10)
+
+        # bottom frame: trends graph
+        graph_frame = ctk.CTkFrame(analytics_tab, fg_color="#1E1E1E", corner_radius=15)
+        graph_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        graph_frame.grid_rowconfigure(0, weight=1)
+        graph_frame.grid_columnconfigure(0, weight=1)
+
         self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.fig.patch.set_facecolor('#2b2b2b')
+        self.fig.patch.set_facecolor('#1E1E1E')
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor('#2b2b2b')
+        self.ax.set_facecolor('#1E1E1E')
         # style axes for dark theme
         for spine in self.ax.spines.values():
             spine.set_color('white')
         self.ax.tick_params(colors='white')
-        self.canvas = FigureCanvasTkAgg(self.fig, master=analytics_tab)
+        self.ax.xaxis.label.set_color('white')
+        self.ax.yaxis.label.set_color('white')
+        self.ax.title.set_color('white')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
         self.canvas.draw()
-        self.canvas.get_tk_widget().pack(expand=True, fill="both")
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.refresh_stats()
         self.refresh_plot()
 
         # polling loop
@@ -417,30 +465,61 @@ class FocusMonitorApp(ctk.CTk):
     def _on_tab_changed(self, event):
         # refresh analytics whenever user switches to that tab
         if self.tabview.get() == "Analytics":
+            self.refresh_stats()
             self.refresh_plot()
 
-    def refresh_plot(self):
+    def refresh_stats(self):
+        """Update lifetime stats labels from database."""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT date, final_score FROM sessions ORDER BY date")
+        try:
+            # total focused duration
+            cursor.execute("SELECT SUM(focused_duration) FROM sessions")
+            total_focused = cursor.fetchone()[0] or 0.0
+            hours = total_focused / 3600.0
+
+            # total distraction points
+            cursor.execute("SELECT SUM(distraction_points) FROM sessions")
+            total_distractions = cursor.fetchone()[0] or 0
+
+            # average score
+            cursor.execute("SELECT AVG(final_score) FROM sessions")
+            avg_score = cursor.fetchone()[0] or 0.0
+
+            self.total_hours_label.configure(text=f"Total Hours Focused\n{hours:.1f}h")
+            self.total_distractions_label.configure(text=f"Total Distractions\n{total_distractions}")
+            self.avg_score_label.configure(text=f"All-Time Avg Score\n{avg_score:.1f}%")
+        except Exception as ex:
+            print(f"Error updating stats: {ex}")
+
+    def refresh_plot(self):
+        """Plot distraction points per session over time."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT date, distraction_points FROM sessions ORDER BY date")
         rows = cursor.fetchall()
         dates = []
-        scores = []
-        for d, s in rows:
+        distraction_data = []
+        for d, dp in rows:
             try:
                 dates.append(datetime.fromisoformat(d))
-                scores.append(s)
+                distraction_data.append(dp)
             except Exception:
                 continue
+        
         self.ax.clear()
-        self.ax.set_facecolor('#2b2b2b')
+        self.ax.set_facecolor('#1E1E1E')
         for spine in self.ax.spines.values():
             spine.set_color('white')
         self.ax.tick_params(colors='white', rotation=45)
+        
         if dates:
-            self.ax.plot(dates, scores, marker='o', color='cyan')
-        self.ax.set_title('Focus Scores Over Time', color='white')
+            self.ax.bar(dates, distraction_data, color='#FF6B6B', alpha=0.7, width=0.3)
+        
+        self.ax.set_title('Distraction Points per Session', color='white')
         self.ax.set_xlabel('Date', color='white')
-        self.ax.set_ylabel('Score (%)', color='white')
+        self.ax.set_ylabel('Distraction Points', color='white')
+        self.ax.xaxis.label.set_color('white')
+        self.ax.yaxis.label.set_color('white')
+        self.ax.title.set_color('white')
         self.fig.autofmt_xdate()
         self.canvas.draw_idle()
 
@@ -457,8 +536,17 @@ class FocusMonitorApp(ctk.CTk):
             self.pitch_label.configure(text=f"Pitch: {data['pitch']}°")
             self.gr_label.configure(text=f"GR: {data['gr']:.2f}")
             
-            counter_color = "red" if data['counter'] > 2.0 else "yellow"
-            self.counter_label.configure(text=f"Distraction: {data['counter']:.1f}s", text_color=counter_color)
+            # update gamified metrics
+            distraction_pts = data.get('distraction_points', 0)
+            self.distraction_label.configure(text=f"Distraction Points: {distraction_pts}")
+            
+            # calculate distraction per minute
+            total_time = self.backend.total_session_time
+            if total_time > 60.0:  # only show after 60 seconds
+                dpm = (distraction_pts / total_time) * 60.0
+                self.dpm_label.configure(text=f"Distractions/Min: {dpm:.1f}")
+            else:
+                self.dpm_label.configure(text="Distractions/Min: 0.0")
 
             score = data.get('focus_score', 0.0)
             self.score_label.configure(text=f"Score: {score:.1f}%")
@@ -470,6 +558,16 @@ class FocusMonitorApp(ctk.CTk):
             self.video_frame.configure(image=self.video_tk, text="")
         except queue.Empty:
             pass
+        
+        # periodically refresh analytics if on that tab (every 10 update cycles = 300ms)
+        if not hasattr(self, '_analytics_refresh_count'):
+            self._analytics_refresh_count = 0
+        self._analytics_refresh_count += 1
+        if self._analytics_refresh_count >= 10:
+            if self.tabview.get() == "Analytics":
+                self.refresh_stats()
+                self.refresh_plot()
+            self._analytics_refresh_count = 0
         
         self.after(30, self.update_gui)
 
@@ -497,12 +595,13 @@ class FocusMonitorApp(ctk.CTk):
         total = self.backend.total_session_time
         focused = self.backend.cumulative_focused_time
         final_score = (focused / total * 100) if total > 0 else 0.0
+        distraction_pts = self.backend.distraction_points
         date_str = datetime.now().isoformat(timespec='seconds')
         try:
             cursor = self.conn.cursor()
             cursor.execute(
-                "INSERT INTO sessions (date, total_duration, focused_duration, final_score) VALUES (?,?,?,?)",
-                (date_str, total, focused, final_score)
+                "INSERT INTO sessions (date, total_duration, focused_duration, final_score, distraction_points) VALUES (?,?,?,?,?)",
+                (date_str, total, focused, final_score, distraction_pts)
             )
             self.conn.commit()
         except Exception as ex:
